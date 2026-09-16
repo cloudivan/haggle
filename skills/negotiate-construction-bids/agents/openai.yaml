@@ -1,0 +1,4 @@
+interface:
+  display_name: "GAEB Construction Negotiator"
+  short_description: "Level and clarify GAEB subcontractor bids"
+  default_prompt: "Use $negotiate-construction-bids to level these X83/X84 bids, identify evidence-backed clarifications, and prepare the final human negotiation."

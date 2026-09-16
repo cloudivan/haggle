@@ -1,0 +1,686 @@
+// One vendor call: buyer-agent voice session + live quote build-up.
+// Sim mode: mic muted, vendor turns come from /vendor-turn (Anthropic + TTS)
+// and are injected back via sendUserMessage. Role-play mode: mic on, the human
+// answers as the vendor. Counter mode: a second ElevenLabs session runs the
+// vendor agent; each side's utterances are relayed into the other session as
+// text, and both speak audibly in their own agent voices.
+
+import { useEffect, useRef, useState } from "react";
+import { ConversationProvider, useConversation } from "@elevenlabs/react";
+import { ExternalLink, Star } from "lucide-react";
+import { toast } from "sonner";
+import TranscriptView from "@/components/calls/TranscriptView";
+import { noEmDash } from "@/lib/utils";
+
+async function api(url, method = "GET", body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+const fmt = (n) => `$${Number(n || 0).toLocaleString()}`;
+
+export default function CallCard(props) {
+  return (
+    <ConversationProvider>
+      <CallSession {...props} />
+    </ConversationProvider>
+  );
+}
+
+// Vendor half of a counter call: its own ElevenLabs session (own provider),
+// mic muted, no tools. It registers start/say/end controls on a ref so the
+// buyer session drives it. Renders nothing; the voice is the UI.
+function VendorCounterpart({ jobId, callId, controlsRef, onVendorText, onVendorMode, onVendorDown }) {
+  return (
+    <ConversationProvider>
+      <VendorCounterpartInner
+        jobId={jobId}
+        callId={callId}
+        controlsRef={controlsRef}
+        onVendorText={onVendorText}
+        onVendorMode={onVendorMode}
+        onVendorDown={onVendorDown}
+      />
+    </ConversationProvider>
+  );
+}
+
+function VendorCounterpartInner({ jobId, callId, controlsRef, onVendorText, onVendorMode, onVendorDown }) {
+  const { startSession, endSession, sendUserMessage, sendUserActivity } = useConversation({
+    micMuted: true,
+  });
+  const upRef = useRef(false);
+
+  useEffect(() => {
+    controlsRef.current = {
+      start: async () => {
+        const { signedUrl, dynamicVariables, voiceId } = await api("/api/agent/session", "POST", {
+          role: "vendor",
+          jobId,
+          callId,
+        });
+        await new Promise((resolve, reject) => {
+          startSession({
+            signedUrl,
+            dynamicVariables,
+            connectionType: "websocket",
+            // Each persona speaks with its policy card's voice.
+            ...(voiceId && { overrides: { tts: { voiceId } } }),
+            onConnect: () => {
+              upRef.current = true;
+              resolve();
+            },
+            onMessage: ({ message, role }) => {
+              if (role === "agent") onVendorText(message);
+            },
+            onModeChange: ({ mode }) => {
+              onVendorMode?.(mode === "speaking");
+            },
+            onError: (message) => {
+              if (!upRef.current) reject(new Error(String(message)));
+            },
+            onDisconnect: () => {
+              if (upRef.current) {
+                upRef.current = false;
+                onVendorDown();
+              }
+            },
+          });
+        });
+      },
+      say: (text) => sendUserMessage(text),
+      // Keeps the vendor's idle timer fed while the buyer's turn plays out,
+      // so it never re-engages ("still there?") over the buyer's audio.
+      activity: () => sendUserActivity(),
+      end: () => {
+        upRef.current = false;
+        endSession();
+      },
+    };
+    return () => {
+      controlsRef.current = null;
+    };
+  }, [jobId, callId, controlsRef, onVendorText, onVendorMode, onVendorDown, startSession, endSession, sendUserMessage, sendUserActivity]);
+
+  useEffect(() => () => endSession(), [endSession]);
+  return null;
+}
+
+function CallSession({ call, job, quote, onChanged, leverageAmount, canNegotiate }) {
+  const [negotiating, setNegotiating] = useState(false);
+
+  const negotiateThisVendor = async () => {
+    setNegotiating(true);
+    try {
+      await api(`/api/jobs/${job._id}/negotiate`, "POST", { vendorName: call.vendorName });
+      toast.success(`Calling ${call.vendorName} back with leverage from the other conversations.`);
+      onChanged?.();
+    } catch (err) {
+      toast.error(err.message);
+    } finally {
+      setNegotiating(false);
+    }
+  };
+  const [mode, setMode] = useState(call.mode || "sim");
+  const [turns, setTurns] = useState([]);
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const turnsRef = useRef([]);
+  const busyRef = useRef(false);
+  const pendingRef = useRef("");
+  const startedRef = useRef(false);
+  const connectedRef = useRef(false);
+
+  const vendorControls = useRef(null);
+
+  // Counter-mode turn-taking: transcript events fire when a turn is GENERATED,
+  // usually BEFORE its audio starts playing. In that window both sessions look
+  // quiet, so a naive quiet-gate front-runs the audio and the agents talk over
+  // each other. Two signals close the gap:
+  // - speaking flags (onModeChange): is a session's audio playing right now
+  // - audio debts: a timestamp set when a side's text is queued (its audio is
+  //   still coming) and cleared the moment that side actually starts speaking.
+  // Nothing is relayed while either side speaks OR owes audio, plus a short
+  // natural gap. Debts expire after 6s so a turn with no audio can't deadlock.
+  const buyerSpeakingRef = useRef(false);
+  const vendorSpeakingRef = useRef(false);
+  const buyerOwesAudioRef = useRef(0);
+  const vendorOwesAudioRef = useRef(0);
+  // Timestamps set when a message is delivered INTO a session, cleared when
+  // that session's reply text arrives. While set, the other session gets
+  // user-activity pings so its idle timer never fires mid-turn: each session
+  // experiences the counterpart's playback as dead air, and without the pings
+  // it would re-engage ("still there?") over the counterpart's audio.
+  const awaitingBuyerReplyRef = useRef(0);
+  const awaitingVendorReplyRef = useRef(0);
+  const lastPingRef = useRef({ buyer: 0, vendor: 0 });
+  const toVendorRef = useRef("");
+  const toBuyerRef = useRef("");
+  const relayInFlightRef = useRef(false);
+  const lastQuietAtRef = useRef(0);
+
+  const { status, startSession, endSession, sendUserMessage, sendContextualUpdate, sendUserActivity } =
+    useConversation({
+      // Everything except role-play runs without the human mic.
+      micMuted: mode !== "roleplay",
+    });
+  const connected = status === "connected" || status === "connecting";
+
+  useEffect(() => () => endSession(), [endSession]);
+
+  // Live leverage: every 5s while on a call, pull the job's current committed
+  // quotes and push changes into the running session as a contextual update,
+  // so quotes landing in OTHER conversations become usable mid-call.
+  const leverageJsonRef = useRef(null);
+  useEffect(() => {
+    if (status !== "connected") {
+      leverageJsonRef.current = null;
+      return;
+    }
+    const tick = async () => {
+      try {
+        const data = await api(`/api/calls/${call._id}/leverage`);
+        const json = JSON.stringify(data.leverage || []);
+        if (leverageJsonRef.current !== null && json !== leverageJsonRef.current && data.leverage?.length) {
+          sendContextualUpdate(
+            `Live update: your competing-bid leverage changed as other calls completed. Current leverage (cite only these, never a company name): ${json}`,
+          );
+        }
+        leverageJsonRef.current = json;
+      } catch {}
+    };
+    tick();
+    const t = setInterval(tick, 5000);
+    return () => clearInterval(t);
+  }, [status, call._id, sendContextualUpdate]);
+
+  // Counter-mode relay pump: every 250ms, if nobody is speaking, nobody owes
+  // audio, and it has been quiet for a beat, deliver exactly one queued
+  // utterance to the other agent. Buyer-to-vendor first (the buyer leads).
+  // It also feeds user-activity pings to whichever session is waiting on the
+  // other's in-flight turn, so neither idle-timer ever fires mid-conversation.
+  useEffect(() => {
+    if (mode !== "counter" || status !== "connected") return;
+    lastQuietAtRef.current = Date.now();
+    const owes = (ref) => ref.current && Date.now() - ref.current < 6000;
+    // Reply pending for up to 30s: covers slow generation and tool-call turns.
+    const awaiting = (ref) => ref.current && Date.now() - ref.current < 30000;
+    const pump = setInterval(() => {
+      const now = Date.now();
+      // A turn is in flight for a side while it speaks, owes audio for queued
+      // text, or has been handed a message it has not answered yet. The OTHER
+      // side gets pinged (throttled to 1s) so it keeps waiting instead of
+      // re-engaging into the silence it perceives.
+      const buyerTurnInFlight =
+        buyerSpeakingRef.current || owes(buyerOwesAudioRef) || awaiting(awaitingBuyerReplyRef);
+      const vendorTurnInFlight =
+        vendorSpeakingRef.current || owes(vendorOwesAudioRef) || awaiting(awaitingVendorReplyRef);
+      if (vendorTurnInFlight && now - lastPingRef.current.buyer > 1000) {
+        lastPingRef.current.buyer = now;
+        sendUserActivity();
+      }
+      if (buyerTurnInFlight && now - lastPingRef.current.vendor > 1000) {
+        lastPingRef.current.vendor = now;
+        vendorControls.current?.activity?.();
+      }
+
+      if (relayInFlightRef.current) return;
+      const bothQuiet =
+        !buyerSpeakingRef.current &&
+        !vendorSpeakingRef.current &&
+        !owes(buyerOwesAudioRef) &&
+        !owes(vendorOwesAudioRef) &&
+        now - lastQuietAtRef.current > 600;
+      if (!bothQuiet) return;
+      if (toVendorRef.current) {
+        const text = toVendorRef.current;
+        toVendorRef.current = "";
+        relayInFlightRef.current = true;
+        awaitingVendorReplyRef.current = Date.now();
+        vendorControls.current?.say(text);
+        setTimeout(() => (relayInFlightRef.current = false), 800);
+      } else if (toBuyerRef.current) {
+        const text = toBuyerRef.current;
+        toBuyerRef.current = "";
+        relayInFlightRef.current = true;
+        awaitingBuyerReplyRef.current = Date.now();
+        sendUserMessage(text);
+        setTimeout(() => (relayInFlightRef.current = false), 800);
+      }
+    }, 250);
+    return () => clearInterval(pump);
+  }, [mode, status, sendUserMessage, sendUserActivity]);
+
+  const pushTurn = (role, text) => {
+    const turn = { role, text, turnIndex: turnsRef.current.length, at: new Date().toISOString() };
+    turnsRef.current = [...turnsRef.current, turn];
+    setTurns(turnsRef.current);
+  };
+  const curTurn = () => Math.max(0, turnsRef.current.length - 1);
+
+  const markFailed = async (msg) => {
+    toast.error(msg);
+    try {
+      await api(`/api/calls/${call._id}`, "PATCH", { status: "failed" });
+    } catch {}
+    onChanged?.();
+  };
+
+  const vendorTurn = async (lastAgentText) => {
+    // Queue buyer utterances that land mid-round-trip: dropping them would
+    // desync turnRefs between the client and the persisted transcript.
+    if (busyRef.current) {
+      pendingRef.current = pendingRef.current
+        ? `${pendingRef.current} ${lastAgentText}`
+        : lastAgentText;
+      return;
+    }
+    busyRef.current = true;
+    try {
+      const { text, audioB64 } = await api(`/api/calls/${call._id}/vendor-turn`, "POST", {
+        lastAgentText,
+      });
+      if (audioB64) {
+        const audio = new Audio(`data:audio/mpeg;base64,${audioB64}`);
+        await new Promise((resolve) => {
+          audio.onended = resolve;
+          audio.onerror = resolve;
+          audio.play().catch(resolve);
+        });
+      }
+      pushTurn("vendor", text);
+      sendUserMessage(text);
+    } catch (err) {
+      toast.error(`Vendor turn failed: ${err.message}`);
+    } finally {
+      busyRef.current = false;
+      if (pendingRef.current) {
+        const queued = pendingRef.current;
+        pendingRef.current = "";
+        vendorTurn(queued);
+      }
+    }
+  };
+
+  // Client tools the buyer agent calls mid-conversation. Errors return a string
+  // so the agent hears about the failure instead of the session crashing.
+  const tool = (fn) => async (params) => {
+    try {
+      return await fn(params || {});
+    } catch (err) {
+      toast.error(err.message);
+      return `Tool failed: ${err.message}`;
+    }
+  };
+
+  const clientTools = {
+    log_quote_item: tool(async ({ fee_key, label, amount, note }) => {
+      const data = await api(`/api/calls/${call._id}/quote-items`, "POST", {
+        fee_key,
+        label,
+        amount,
+        note,
+        turnRef: curTurn(),
+      });
+      onChanged?.();
+      return JSON.stringify(data);
+    }),
+    commit_quote: tool(async ({ total, guaranteed, valid_until }) => {
+      const data = await api(`/api/calls/${call._id}/commit`, "POST", {
+        total,
+        guaranteed,
+        valid_until,
+        turnRef: curTurn(),
+      });
+      (data.redFlags || []).forEach((f) => toast.warning(f.message));
+      onChanged?.();
+      return JSON.stringify(data);
+    }),
+    record_negotiation_event: tool(async ({ lever_id, before_total, after_total, note }) => {
+      await api(`/api/calls/${call._id}/negotiation-event`, "POST", {
+        lever_id,
+        before_total,
+        after_total,
+        note,
+        turnRef: curTurn(),
+      });
+      onChanged?.();
+      return "recorded";
+    }),
+    log_outcome: tool(async ({ type, note }) => {
+      await api(`/api/calls/${call._id}/outcome`, "POST", { type, note, turnRef: curTurn() });
+      onChanged?.();
+      return "logged";
+    }),
+    get_leverage: tool(async () => {
+      const data = await api(`/api/calls/${call._id}/leverage`);
+      return JSON.stringify(data.leverage || []);
+    }),
+    reset_quote_items: tool(async () => {
+      const data = await api(`/api/calls/${call._id}/reset-items`, "POST", {});
+      onChanged?.();
+      return JSON.stringify(data);
+    }),
+  };
+
+  const finish = async () => {
+    vendorControls.current?.end();
+    if (!startedRef.current) return;
+    startedRef.current = false;
+    setStarting(false);
+    try {
+      await api(`/api/calls/${call._id}/finalize`, "POST", {});
+    } catch (err) {
+      toast.error(`Finalize failed: ${err.message}`);
+      try {
+        await api(`/api/calls/${call._id}`, "PATCH", { status: "failed" });
+      } catch {}
+    }
+    onChanged?.();
+  };
+
+  const start = async () => {
+    setStarting(true);
+    try {
+      // Counter mode: bring the vendor agent up first. It has no first
+      // message, so it waits silently until the buyer's opener is relayed in.
+      if (mode === "counter") await vendorControls.current.start();
+      const { signedUrl, dynamicVariables } = await api("/api/agent/session", "POST", {
+        role: "buyer",
+        jobId: job._id,
+        callId: call._id,
+      });
+      const sim = mode === "sim";
+      const counter = mode === "counter";
+      turnsRef.current = [];
+      pendingRef.current = "";
+      setTurns([]);
+      startedRef.current = true;
+      connectedRef.current = false;
+      startSession({
+        signedUrl,
+        dynamicVariables,
+        connectionType: "websocket",
+        clientTools,
+        onConnect: async ({ conversationId }) => {
+          connectedRef.current = true;
+          setStarting(false);
+          try {
+            await api(`/api/calls/${call._id}`, "PATCH", {
+              status: "live",
+              elevenConversationId: conversationId,
+              mode,
+            });
+          } catch (err) {
+            toast.error(err.message);
+          }
+          onChanged?.();
+        },
+        onModeChange: ({ mode: m }) => {
+          buyerSpeakingRef.current = m === "speaking";
+          // Audio began: the buyer's pending turn is no longer owed.
+          if (m === "speaking") buyerOwesAudioRef.current = 0;
+          else lastQuietAtRef.current = Date.now();
+        },
+        onMessage: ({ message, role }) => {
+          if (role === "agent") {
+            pushTurn("buyer", message);
+            if (sim) vendorTurn(message);
+            // Counter mode: queue for the relay pump instead of sending now.
+            // The queued turn's audio is still coming, so mark it owed. The
+            // buyer has now answered whatever it was handed.
+            if (counter) {
+              toVendorRef.current = toVendorRef.current
+                ? `${toVendorRef.current} ${message}`
+                : message;
+              buyerOwesAudioRef.current = Date.now();
+              awaitingBuyerReplyRef.current = 0;
+            }
+          } else if (!sim && !counter) {
+            pushTurn("vendor", message);
+          }
+        },
+        onError: (message) => {
+          toast.error(String(message));
+          // A failure before onConnect means the session never opened; the
+          // SDK won't fire onDisconnect, so unstick the button here.
+          if (!connectedRef.current) {
+            setStarting(false);
+            startedRef.current = false;
+          }
+        },
+        onDisconnect: () => finish(),
+      });
+    } catch (err) {
+      setStarting(false);
+      startedRef.current = false;
+      await markFailed(`Could not start call: ${err.message}`);
+    }
+  };
+
+  const displayStatus = connected ? "live" : call.status;
+  const canStart = !connected && !starting && displayStatus !== "done";
+  const lines = quote?.lines || [];
+  const total = quote?.total ?? lines.reduce((s, l) => s + (l.amount || 0), 0);
+  const displayTurns = turns.length ? turns : call.transcript || [];
+
+  const statusChip = {
+    pending: <span className="badge badge-info">pending</span>,
+    live: (
+      <span className="badge badge-success inline-flex items-center gap-1.5">
+        <span className="h-3 w-3 animate-spin rounded-full border-2 border-success-600 border-t-transparent" /> live
+      </span>
+    ),
+    done: <span className="badge bg-muted text-muted-foreground">done</span>,
+    failed: <span className="badge badge-error">failed</span>,
+  }[displayStatus] || <span className="badge badge-info">{displayStatus}</span>;
+
+  // Real Places businesses link out to their Google listing; canned/sim-only
+  // vendors have no listing to link to.
+  const googleUrl =
+    call.placeId && !call.placeId.startsWith("canned")
+      ? `https://www.google.com/maps/place/?q=place_id:${call.placeId}`
+      : null;
+
+  return (
+    <div className="card flex flex-col gap-3 p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        {googleUrl ? (
+          <a
+            href={googleUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open this business on Google"
+            className="focus-ring inline-flex items-center gap-1 font-display text-sm font-semibold text-foreground hover:text-primary-500 hover:underline"
+          >
+            {call.vendorName}
+            <ExternalLink aria-hidden="true" className="h-3.5 w-3.5 text-muted-foreground" />
+          </a>
+        ) : (
+          <h3 className="font-display text-sm font-semibold text-foreground">{call.vendorName}</h3>
+        )}
+        {call.rating != null && (
+          <span className="inline-flex items-center gap-0.5 text-xs text-muted-foreground">
+            <Star aria-hidden="true" className="h-3 w-3 fill-warning-400 text-warning-400" />
+            {call.rating}
+          </span>
+        )}
+        <span className={`badge ${call.round === 2 ? "badge-warning" : "badge-info"}`}>
+          Round {call.round}
+        </span>
+        {statusChip}
+        {call.round === 2 && leverageAmount != null && (
+          <span className="badge badge-info">using leverage: {fmt(leverageAmount)} best bid</span>
+        )}
+      </div>
+
+      {/* Sim calls run server-side in batches, real calls dial actual
+          businesses, role-play is the live browser session. */}
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        {mode === "roleplay" ? (
+          <span className="badge bg-foreground text-background">live role-play</span>
+        ) : mode === "real" ? (
+          <>
+            <span className="badge badge-warning">real call</span>
+            {call.batch && <span className="badge badge-info">batch {call.batch}</span>}
+            {call.phone && <span>{call.phone}</span>}
+            {call.statusDetail && displayStatus === "live" && (
+              <span className="inline-flex items-center gap-1.5 text-foreground">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-success-500" aria-hidden="true" />
+                {call.statusDetail}
+              </span>
+            )}
+          </>
+        ) : call.batch ? (
+          <>
+            <span className="badge badge-info">auto (batch {call.batch})</span>
+            {displayStatus === "pending" && <span>waiting for its batch…</span>}
+          </>
+        ) : mode === "counter" ? (
+          <>
+            <span className="badge bg-foreground text-background">counter-agent</span>
+            {connected && <span>two live agent sessions, relayed turn by turn</span>}
+          </>
+        ) : (
+          <>
+            <span className="badge bg-foreground text-background">agent vs agent</span>
+            {connected && <span>buyer live, vendor speaks via TTS, mic muted</span>}
+          </>
+        )}
+      </div>
+
+      {/* Counter mode mounts the vendor agent session alongside the buyer. */}
+      {mode === "counter" && (
+        <VendorCounterpart
+          jobId={job._id}
+          callId={call._id}
+          controlsRef={vendorControls}
+          onVendorText={(text) => {
+            pushTurn("vendor", text);
+            // Queue for the relay pump; the vendor's audio for this turn is
+            // still coming, so mark it owed until playback starts. The vendor
+            // has now answered whatever it was handed.
+            toBuyerRef.current = toBuyerRef.current ? `${toBuyerRef.current} ${text}` : text;
+            vendorOwesAudioRef.current = Date.now();
+            awaitingVendorReplyRef.current = 0;
+          }}
+          onVendorMode={(speaking) => {
+            vendorSpeakingRef.current = speaking;
+            if (speaking) vendorOwesAudioRef.current = 0;
+            else lastQuietAtRef.current = Date.now();
+          }}
+          onVendorDown={() => endSession()}
+        />
+      )}
+
+      {/* Running quote */}
+      <div className="border-t border-border pt-3">
+        <div className="flex items-baseline justify-between">
+          <span className="text-xs text-muted-foreground">Quote</span>
+          <span className="font-display text-lg font-semibold text-foreground">{fmt(total)}</span>
+        </div>
+        {lines.length > 0 && (
+          <ul className="mt-1 space-y-0.5">
+            {lines.map((l, i) => (
+              <li key={i} className="flex justify-between text-xs text-muted-foreground">
+                <span>{l.label || l.feeKey}</span>
+                <span>{fmt(l.amount)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {quote?.committed && <span className="badge badge-success">committed</span>}
+          {quote?.guaranteed && <span className="badge badge-success">guaranteed</span>}
+          {(quote?.redFlags || []).map((f) => (
+            <span key={f.id} className="badge badge-error" title={f.message}>
+              {f.id}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* Live caption: the latest utterance, so a busy call grid visibly talks
+          without opening every transcript. */}
+      {displayStatus === "live" && displayTurns.length > 0 && !showTranscript && (
+        <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+          <span
+            className="mt-1 h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-success-500"
+            aria-hidden="true"
+          />
+          <span className="line-clamp-2">
+            <span className="font-medium text-foreground">
+              {["agent", "buyer", "assistant"].includes(displayTurns[displayTurns.length - 1].role)
+                ? "Buyer"
+                : "Vendor"}
+              :
+            </span>{" "}
+            {noEmDash(displayTurns[displayTurns.length - 1].text)}
+          </span>
+        </p>
+      )}
+
+      {/* Negotiate this vendor using everything learned from the other calls */}
+      {canNegotiate && displayStatus === "done" && quote?.committed && call.round === 1 && (
+        <button
+          onClick={negotiateThisVendor}
+          disabled={negotiating}
+          className="btn btn-secondary self-start text-xs disabled:opacity-50"
+          title="Call this vendor back, armed with the best bid and terms from the other conversations"
+        >
+          {negotiating ? "Setting up…" : "Negotiate with this vendor"}
+        </button>
+      )}
+
+      {/* Call recording, once finalize has pulled it */}
+      {call.recordingPath && (
+        <audio
+          controls
+          preload="none"
+          className="h-9 w-full"
+          src={`/api/calls/${call._id}/audio`}
+        />
+      )}
+
+      {/* Transcript */}
+      <button
+        onClick={() => setShowTranscript((s) => !s)}
+        className="self-start text-xs text-muted-foreground hover:text-foreground"
+      >
+        {showTranscript ? "Hide" : "Show"} transcript ({displayTurns.length})
+      </button>
+      {showTranscript && <TranscriptView transcript={displayTurns} />}
+
+      {/* Browser-started calls: role-play (human vendor via mic) and live sim
+          (agent vs agent, audible). Batch sim and real calls are server-driven
+          and have no start button. */}
+      {(mode === "roleplay" || mode === "counter" || (mode === "sim" && !call.batch)) && (
+        <div className="mt-auto flex gap-2 border-t border-border pt-3">
+          {connected ? (
+            <button onClick={() => endSession()} className="btn bg-error-500 text-white hover:bg-error-600">
+              End call
+            </button>
+          ) : (
+            <button onClick={start} disabled={!canStart} className="btn btn-primary disabled:opacity-50">
+              {starting
+                ? "Connecting…"
+                : displayStatus === "failed"
+                  ? "Retry call"
+                  : mode === "roleplay"
+                    ? "Answer as vendor"
+                    : mode === "counter"
+                      ? "Run counter-agents"
+                      : "Run agent vs agent"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
